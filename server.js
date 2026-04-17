@@ -487,11 +487,29 @@ app.post('/v1/sessions/:id/complete', async (req, res) => {
 });
 
 app.post('/v1/feedback', async (req, res) => {
-  const category = req.body?.category || 'general';
-  const note = req.body?.note || '';
-  const sessionId = req.body?.sessionId || null;
-  const feedback = await saveFeedback(category, note, sessionId);
-  res.status(201).json(ok(feedback, 'feedback-1'));
+  try {
+    const category = req.body?.category || 'general';
+    const note = req.body?.note || '';
+    const sessionId = req.body?.sessionId || null;
+
+    const feedback = await saveFeedback(category, note, sessionId);
+
+    res.status(201).json(ok(feedback, 'feedback-1'));
+  } catch (error) {
+    console.error('Feedback route failed:', error);
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'FEEDBACK_SAVE_FAILED',
+        message: 'Could not save feedback',
+        retryable: false
+      },
+      meta: {
+        request_id: 'feedback-1',
+        api_version: 'v1'
+      }
+    });
+  }
 });
 
 ensureBootstrapRows()
