@@ -130,19 +130,24 @@ async function initDb() {
   `);
 
   await pool.query(`
-    insert into user_preferences (
-      user_id, primary_locale, guidance_mode, ambience_enabled, ambience_mood
-    )
+    create table if not exists user_feedback (
+      id bigserial primary key,
+      category text not null,
+      note text,
+      session_id text,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    insert into user_preferences (user_id, primary_locale, guidance_mode, ambience_enabled, ambience_mood)
     values ('local-user-1', 'en-KE', 'listen_only', true, 'calm_dining')
     on conflict (user_id) do nothing;
   `);
 }
 
 async function getPreferences() {
-  const result = await pool.query(
-    `select user_id, primary_locale, guidance_mode, ambience_enabled, ambience_mood
-     from user_preferences where user_id = 'local-user-1' limit 1`
-  );
+  const result = await pool.query(`select user_id, primary_locale, guidance_mode, ambience_enabled, ambience_mood from user_preferences where user_id = 'local-user-1' limit 1`);
   const row = result.rows[0];
   return {
     userId: row.user_id,
@@ -163,9 +168,7 @@ async function savePreferences(updates) {
     ambienceMood: updates.ambienceMood ?? current.ambienceMood,
   };
   await pool.query(
-    `update user_preferences
-     set primary_locale = $1, guidance_mode = $2, ambience_enabled = $3, ambience_mood = $4, updated_at = now()
-     where user_id = 'local-user-1'`,
+    `update user_preferences set primary_locale = $1, guidance_mode = $2, ambience_enabled = $3, ambience_mood = $4, updated_at = now() where user_id = 'local-user-1'`,
     [next.primaryLocale, next.guidanceMode, next.ambienceEnabled, next.ambienceMood]
   );
   return next;
@@ -228,18 +231,13 @@ async function getSession(sessionId) {
 }
 
 async function getLatestActiveSession() {
-  const result = await pool.query(
-    `select * from cooking_sessions where completed = false order by updated_at desc, created_at desc limit 1`
-  );
+  const result = await pool.query(`select * from cooking_sessions where completed = false order by updated_at desc, created_at desc limit 1`);
   if (result.rowCount === 0) return null;
   return mapSession(result.rows[0]);
 }
 
 async function getSessionHistory(limit = 10) {
-  const result = await pool.query(
-    `select * from cooking_sessions order by updated_at desc, created_at desc limit $1`,
-    [limit]
-  );
+  const result = await pool.query(`select * from cooking_sessions order by updated_at desc, created_at desc limit $1`, [limit]);
   return result.rows.map(mapSession);
 }
 
@@ -248,9 +246,7 @@ async function updateSessionAudio(sessionId, audioPatch) {
   if (!session) return null;
   const nextAudio = { ...session.audioState, ...audioPatch };
   await pool.query(
-    `update cooking_sessions
-     set audio_muted = $1, audio_ducking_active = $2, audio_requested_volume = $3, updated_at = now()
-     where session_id = $4`,
+    `update cooking_sessions set audio_muted = $1, audio_ducking_active = $2, audio_requested_volume = $3, updated_at = now() where session_id = $4`,
     [nextAudio.muted, nextAudio.duckingActive, nextAudio.requestedVolume, sessionId]
   );
   return nextAudio;
@@ -267,38 +263,30 @@ async function advanceSession(sessionId) {
     nextStep += 1;
     nextPhase = nextStep === maxSteps ? "finish" : "cook";
   }
-  await pool.query(
-    `update cooking_sessions
-     set current_step_number = $1, current_phase = $2, updated_at = now()
-     where session_id = $3`,
-    [nextStep, nextPhase, sessionId]
-  );
+  await pool.query(`update cooking_sessions set current_step_number = $1, current_phase = $2, updated_at = now() where session_id = $3`, [nextStep, nextPhase, sessionId]);
   return getSession(sessionId);
 }
 
 async function completeSession(sessionId) {
-  await pool.query(
-    `update cooking_sessions
-     set state = 'completed', current_phase = 'serve', completed = true, updated_at = now()
-     where session_id = $1`,
-    [sessionId]
-  );
+  await pool.query(`update cooking_sessions set state = 'completed', current_phase = 'serve', completed = true, updated_at = now() where session_id = $1`, [sessionId]);
   return getSession(sessionId);
 }
 
 async function recordIssue(sessionId, issueType, recoveryText) {
-  await pool.query(
-    `insert into session_issues (session_id, issue_type, recovery_text) values ($1,$2,$3)`,
-    [sessionId, issueType, recoveryText]
-  );
+  await pool.query(`insert into session_issues (session_id, issue_type, recovery_text) values ($1,$2,$3)`, [sessionId, issueType, recoveryText]);
+}
+
+async function saveFeedback(category, note, sessionId = null) {
+  const result = await pool.query(`insert into user_feedback (category, note, session_id) values ($1,$2,$3) returning id, category, note, session_id, created_at`, [category, note ?? "", sessionId]);
+  return result.rows[0];
 }
 
 app.get("/health", async (_req, res) => {
   try {
     await pool.query("select 1");
-    res.json({ ok: true, service: "nomad-beta-backend-v3", now: new Date().toISOString() });
+    res.json({ ok: true, service: "nomad-beta-backend-v4", now: new Date().toISOString() });
   } catch {
-    res.status(500).json({ ok: false, service: "nomad-beta-backend-v3", error: "database_unavailable" });
+    res.status(500).json({ ok: false, service: "nomad-beta-backend-v4", error: "database_unavailable" });
   }
 });
 
@@ -323,7 +311,7 @@ app.post("/v1/generation/runs", (req, res) => {
     note: item.note,
     rankOrder: index + 1,
   }));
-  res.status(201).json(ok({ run: { generationRunId: "db-run-3" }, candidates }, "gen-1"));
+  res.status(201).json(ok({ run: { generationRunId: "db-run-4" }, candidates }, "gen-1"));
 });
 
 app.get("/v1/recipes/:id", (req, res) => {
@@ -384,12 +372,20 @@ app.post("/v1/sessions/:id/complete", async (req, res) => {
   res.json(ok(session, "complete-2"));
 });
 
+app.post("/v1/feedback", async (req, res) => {
+  const category = req.body?.category || "general";
+  const note = req.body?.note || "";
+  const sessionId = req.body?.sessionId || null;
+  const feedback = await saveFeedback(category, note, sessionId);
+  res.status(201).json(ok(feedback, "feedback-1"));
+});
+
 const PORT = process.env.PORT || 4000;
 
 initDb()
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`Nomad Beta backend v3 running on http://0.0.0.0:${PORT}`);
+      console.log(`Nomad Beta backend v4 running on http://0.0.0.0:${PORT}`);
     });
   })
   .catch((error) => {
