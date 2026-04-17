@@ -21,6 +21,8 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+const CURRENT_USER_ID = "local-user-1";
+
 const recipes = {
   pilaf: {
     id: "pilaf",
@@ -87,67 +89,54 @@ function issueMessage(issueType) {
   }
 }
 
-async function initDb() {
-  await pool.query(`
-    create table if not exists user_preferences (
-      user_id text primary key,
-      primary_locale text not null,
-      guidance_mode text not null,
-      ambience_enabled boolean not null,
-      ambience_mood text not null,
-      updated_at timestamptz not null default now()
-    );
-  `);
+async function ensureBootstrapRows() {
+  await pool.query(
+    `insert into users (user_id, display_name, account_status, signup_source)
+     values ($1, 'Nomad Beta User', 'active', 'beta_invite')
+     on conflict (user_id) do nothing`,
+    [CURRENT_USER_ID]
+  );
 
-  await pool.query(`
-    create table if not exists cooking_sessions (
-      session_id text primary key,
-      recipe_id text not null,
-      state text not null,
-      current_phase text not null,
-      current_step_number integer not null,
-      guidance_mode text not null,
-      session_locale text not null,
-      ambience_enabled boolean not null,
-      ambience_mood_tag text not null,
-      audio_muted boolean not null,
-      audio_ducking_active boolean not null,
-      audio_requested_volume numeric not null,
-      completed boolean not null,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    );
-  `);
+  await pool.query(
+    `insert into user_profiles (
+      user_id, primary_locale_code, country_code, region_text,
+      cooking_confidence_level, literacy_mode, guidance_mode
+    ) values ($1, 'en-KE', 'KE', 'Mombasa', 'beginner', 'full_text', 'listen_only')
+    on conflict (user_id) do nothing`,
+    [CURRENT_USER_ID]
+  );
 
-  await pool.query(`
-    create table if not exists session_issues (
-      id bigserial primary key,
-      session_id text not null,
-      issue_type text not null,
-      recovery_text text not null,
-      created_at timestamptz not null default now()
-    );
-  `);
-
-  await pool.query(`
-    create table if not exists user_feedback (
-      id bigserial primary key,
-      category text not null,
-      note text,
-      session_id text,
-      created_at timestamptz not null default now()
-    );
-  `);
-
-  await pool.query(`
-    insert into user_preferences (user_id, primary_locale, guidance_mode, ambience_enabled, ambience_mood)
-    values ('local-user-1', 'en-KE', 'listen_only', true, 'calm_dining')
-    on conflict (user_id) do nothing;
-  `);
+  await pool.query(
+    `insert into user_preferences (
+      user_id, primary_locale, guidance_mode, ambience_enabled, ambience_mood,
+      ambient_sound_default_level, voice_enabled, auto_resume_session, measurement_system, default_servings
+    ) values ($1, 'en-KE', 'listen_only', true, 'calm_dining', 0.35, true, true, 'metric', 2)
+    on conflict (user_id) do nothing`,
+    [CURRENT_USER_ID]
+  );
 }
 
-async function getPreferences() {
-  const result = await pool.query(`select user_id, primary_locale, guidance_mode, ambience_enabled, ambience_mood from user_preferences where user_id = 'local-user-1' limit 1`);
+async function getMe() {
+  const result = await pool.query(
+    `select
+        u.user_id,
+        coalesce(up.primary_locale, p.primary_locale_code) as primary_locale,
+        coalesce(up.guidance_mode, p.guidance_mode) as guidance_mode,
+        coalesce(up.ambience_enabled, true) as ambience_enabled,
+        coalesce(up.ambience_mood, 'calm_dining') as ambience_mood,
+        coalesce(up.ambient_sound_default_level, 0.35) as ambient_sound_default_level,
+        coalesce(up.voice_enabled, true) as voice_enabled,
+        coalesce(up.auto_resume_session, true) as auto_resume_session,
+        coalesce(up.measurement_system, 'metric') as measurement_system,
+        up.default_servings
+     from users u
+     left join user_profiles p on p.user_id = u.user_id
+     left join user_preferences up on up.user_id = u.user_id
+     where u.user_id = $1
+     limit 1`,
+    [CURRENT_USER_ID]
+  );
+
   const row = result.rows[0];
   return {
     userId: row.user_id,
@@ -158,20 +147,34 @@ async function getPreferences() {
   };
 }
 
-async function savePreferences(updates) {
-  const current = await getPreferences();
-  const next = {
-    userId: "local-user-1",
-    primaryLocale: updates.primaryLocale ?? current.primaryLocale,
-    guidanceMode: updates.guidanceMode ?? current.guidanceMode,
-    ambienceEnabled: typeof updates.ambienceEnabled === "boolean" ? updates.ambienceEnabled : current.ambienceEnabled,
-    ambienceMood: updates.ambienceMood ?? current.ambienceMood,
-  };
+async function savePreferences(patch) {
+  const current = await getMe();
+  const nextPrimaryLocale = patch.primaryLocale ?? current.primaryLocale;
+  const nextGuidanceMode = patch.guidanceMode ?? current.guidanceMode;
+  const nextAmbienceEnabled = typeof patch.ambienceEnabled === 'boolean' ? patch.ambienceEnabled : current.ambienceEnabled;
+  const nextAmbienceMood = patch.ambienceMood ?? current.ambienceMood;
+
   await pool.query(
-    `update user_preferences set primary_locale = $1, guidance_mode = $2, ambience_enabled = $3, ambience_mood = $4, updated_at = now() where user_id = 'local-user-1'`,
-    [next.primaryLocale, next.guidanceMode, next.ambienceEnabled, next.ambienceMood]
+    `update user_profiles
+     set primary_locale_code = $1,
+         guidance_mode = $2,
+         updated_at = now()
+     where user_id = $3`,
+    [nextPrimaryLocale, nextGuidanceMode, CURRENT_USER_ID]
   );
-  return next;
+
+  await pool.query(
+    `update user_preferences
+     set primary_locale = $1,
+         guidance_mode = $2,
+         ambience_enabled = $3,
+         ambience_mood = $4,
+         updated_at = now()
+     where user_id = $5`,
+    [nextPrimaryLocale, nextGuidanceMode, nextAmbienceEnabled, nextAmbienceMood, CURRENT_USER_ID]
+  );
+
+  return getMe();
 }
 
 function mapSession(row) {
@@ -197,59 +200,134 @@ function mapSession(row) {
   };
 }
 
-async function createSession(recipeId, preferences) {
+async function createSession(recipeId) {
+  const me = await getMe();
   const sessionId = crypto.randomUUID();
+
   await pool.query(
     `insert into cooking_sessions (
-      session_id, recipe_id, state, current_phase, current_step_number,
+      session_id, user_id, recipe_id, state, current_phase, current_step_number,
       guidance_mode, session_locale, ambience_enabled, ambience_mood_tag,
-      audio_muted, audio_ducking_active, audio_requested_volume, completed
-    ) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-    [
-      sessionId,
-      recipeId,
-      "cook_active",
-      "prep",
-      1,
-      preferences.guidanceMode,
-      preferences.primaryLocale,
-      preferences.ambienceEnabled,
-      preferences.ambienceMood,
-      false,
-      true,
-      0.35,
-      false,
-    ]
+      audio_muted, audio_ducking_active, audio_requested_volume, completed,
+      started_at, last_active_at, created_at, updated_at
+    ) values ($1,$2,$3,'active','prep',1,$4,$5,$6,$7,false,true,0.35,false,now(),now(),now(),now())`,
+    [sessionId, CURRENT_USER_ID, recipeId, me.guidanceMode, me.primaryLocale, me.ambienceEnabled, me.ambienceMood]
   );
+
+  await pool.query(
+    `insert into session_audio_state (session_id, ambient_enabled, muted, ducking_active, current_track_ref, requested_volume)
+     values ($1, $2, false, true, null, 0.35)
+     on conflict (session_id) do nothing`,
+    [sessionId, me.ambienceEnabled]
+  );
+
+  await pool.query(
+    `insert into session_step_events (session_id, recipe_step_ref, event_type, event_payload_json)
+     values ($1, null, 'step_started', '{}'::jsonb)`,
+    [sessionId]
+  );
+
   return getSession(sessionId);
 }
 
 async function getSession(sessionId) {
-  const result = await pool.query(`select * from cooking_sessions where session_id = $1 limit 1`, [sessionId]);
+  const result = await pool.query(
+    `select cs.*, 
+            coalesce(sa.ambient_enabled, cs.ambience_enabled) as audio_ambient_enabled,
+            coalesce(sa.muted, cs.audio_muted) as audio_muted_effective,
+            coalesce(sa.ducking_active, cs.audio_ducking_active) as audio_ducking_effective,
+            coalesce(sa.requested_volume, cs.audio_requested_volume) as audio_requested_effective
+     from cooking_sessions cs
+     left join session_audio_state sa on sa.session_id = cs.session_id
+     where cs.session_id = $1
+     limit 1`,
+    [sessionId]
+  );
   if (result.rowCount === 0) return null;
-  return mapSession(result.rows[0]);
+  const row = result.rows[0];
+  return {
+    sessionId: row.session_id,
+    recipeId: row.recipe_id,
+    recipeTitle: recipes[row.recipe_id]?.title ?? row.recipe_id,
+    state: row.state,
+    currentPhase: row.current_phase,
+    currentStepNumber: row.current_step_number,
+    guidanceMode: row.guidance_mode,
+    sessionLocale: row.session_locale,
+    ambienceEnabled: row.ambience_enabled,
+    ambienceMoodTag: row.ambience_mood_tag,
+    audioState: {
+      muted: row.audio_muted_effective,
+      duckingActive: row.audio_ducking_effective,
+      requestedVolume: Number(row.audio_requested_effective),
+    },
+    completed: row.completed,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 async function getLatestActiveSession() {
-  const result = await pool.query(`select * from cooking_sessions where completed = false order by updated_at desc, created_at desc limit 1`);
+  const result = await pool.query(
+    `select session_id
+     from cooking_sessions
+     where user_id = $1 and completed = false
+     order by updated_at desc, created_at desc
+     limit 1`,
+    [CURRENT_USER_ID]
+  );
   if (result.rowCount === 0) return null;
-  return mapSession(result.rows[0]);
+  return getSession(result.rows[0].session_id);
 }
 
 async function getSessionHistory(limit = 10) {
-  const result = await pool.query(`select * from cooking_sessions order by updated_at desc, created_at desc limit $1`, [limit]);
-  return result.rows.map(mapSession);
+  const result = await pool.query(
+    `select session_id
+     from cooking_sessions
+     where user_id = $1
+     order by updated_at desc, created_at desc
+     limit $2`,
+    [CURRENT_USER_ID, limit]
+  );
+  const sessions = [];
+  for (const row of result.rows) {
+    const s = await getSession(row.session_id);
+    if (s) sessions.push(s);
+  }
+  return sessions;
 }
 
-async function updateSessionAudio(sessionId, audioPatch) {
-  const session = await getSession(sessionId);
-  if (!session) return null;
-  const nextAudio = { ...session.audioState, ...audioPatch };
+async function updateSessionAudio(sessionId, patch) {
+  const existing = await getSession(sessionId);
+  if (!existing) return null;
+  const muted = typeof patch.muted === 'boolean' ? patch.muted : existing.audioState.muted;
+  const duckingActive = typeof patch.duckingActive === 'boolean' ? patch.duckingActive : existing.audioState.duckingActive;
+  const requestedVolume = typeof patch.requestedVolume === 'number' ? patch.requestedVolume : existing.audioState.requestedVolume;
+
   await pool.query(
-    `update cooking_sessions set audio_muted = $1, audio_ducking_active = $2, audio_requested_volume = $3, updated_at = now() where session_id = $4`,
-    [nextAudio.muted, nextAudio.duckingActive, nextAudio.requestedVolume, sessionId]
+    `insert into session_audio_state (session_id, ambient_enabled, muted, ducking_active, current_track_ref, requested_volume, last_changed_at)
+     values ($1, $2, $3, $4, null, $5, now())
+     on conflict (session_id)
+     do update set ambient_enabled = excluded.ambient_enabled,
+                   muted = excluded.muted,
+                   ducking_active = excluded.ducking_active,
+                   requested_volume = excluded.requested_volume,
+                   last_changed_at = now()`,
+    [sessionId, existing.ambienceEnabled, muted, duckingActive, requestedVolume]
   );
-  return nextAudio;
+
+  await pool.query(
+    `update cooking_sessions
+     set audio_muted = $1,
+         audio_ducking_active = $2,
+         audio_requested_volume = $3,
+         updated_at = now(),
+         last_active_at = now()
+     where session_id = $4`,
+    [muted, duckingActive, requestedVolume, sessionId]
+  );
+
+  return (await getSession(sessionId)).audioState;
 }
 
 async function advanceSession(sessionId) {
@@ -261,47 +339,84 @@ async function advanceSession(sessionId) {
   let nextPhase = session.currentPhase;
   if (nextStep < maxSteps) {
     nextStep += 1;
-    nextPhase = nextStep === maxSteps ? "finish" : "cook";
+    nextPhase = nextStep === maxSteps ? 'finish' : 'cook';
   }
-  await pool.query(`update cooking_sessions set current_step_number = $1, current_phase = $2, updated_at = now() where session_id = $3`, [nextStep, nextPhase, sessionId]);
+
+  await pool.query(
+    `update cooking_sessions
+     set current_step_number = $1,
+         current_phase = $2,
+         updated_at = now(),
+         last_active_at = now()
+     where session_id = $3`,
+    [nextStep, nextPhase, sessionId]
+  );
+
+  await pool.query(
+    `insert into session_step_events (session_id, recipe_step_ref, event_type, event_payload_json)
+     values ($1, null, 'step_completed', '{}'::jsonb)`,
+    [sessionId]
+  );
+
   return getSession(sessionId);
 }
 
 async function completeSession(sessionId) {
-  await pool.query(`update cooking_sessions set state = 'completed', current_phase = 'serve', completed = true, updated_at = now() where session_id = $1`, [sessionId]);
+  await pool.query(
+    `update cooking_sessions
+     set state = 'completed',
+         current_phase = 'serve',
+         completed = true,
+         completed_at = now(),
+         updated_at = now(),
+         last_active_at = now()
+     where session_id = $1`,
+    [sessionId]
+  );
   return getSession(sessionId);
 }
 
 async function recordIssue(sessionId, issueType, recoveryText) {
-  await pool.query(`insert into session_issues (session_id, issue_type, recovery_text) values ($1,$2,$3)`, [sessionId, issueType, recoveryText]);
+  await pool.query(
+    `insert into session_issue_reports (
+      session_issue_report_id, session_id, issue_type, user_note, recovery_text_served, step_number, created_at
+    ) values (gen_random_uuid(), $1, $2, null, $3, null, now())`,
+    [sessionId, issueType, recoveryText]
+  );
 }
 
 async function saveFeedback(category, note, sessionId = null) {
-  const result = await pool.query(`insert into user_feedback (category, note, session_id) values ($1,$2,$3) returning id, category, note, session_id, created_at`, [category, note ?? "", sessionId]);
+  const result = await pool.query(
+    `insert into user_feedback (
+      feedback_id, user_id, session_id, feedback_category, feedback_text, device_context_json, created_at
+    ) values (gen_random_uuid(), $1, $2, $3, $4, '{}'::jsonb, now())
+     returning feedback_id, feedback_category, feedback_text, session_id, created_at`,
+    [CURRENT_USER_ID, sessionId, category, note ?? '']
+  );
   return result.rows[0];
 }
 
-app.get("/health", async (_req, res) => {
+app.get('/health', async (_req, res) => {
   try {
-    await pool.query("select 1");
-    res.json({ ok: true, service: "nomad-beta-backend-v4", now: new Date().toISOString() });
+    await pool.query('select 1');
+    res.json({ ok: true, service: 'nomad-db-build-pack-1a', now: new Date().toISOString() });
   } catch {
-    res.status(500).json({ ok: false, service: "nomad-beta-backend-v4", error: "database_unavailable" });
+    res.status(500).json({ ok: false, service: 'nomad-db-build-pack-1a', error: 'database_unavailable' });
   }
 });
 
-app.get("/v1/me", async (_req, res) => {
-  const prefs = await getPreferences();
-  res.json(ok(prefs, "prefs-1"));
+app.get('/v1/me', async (_req, res) => {
+  const me = await getMe();
+  res.json(ok(me, 'me-1'));
 });
 
-app.patch("/v1/me/preferences", async (req, res) => {
+app.patch('/v1/me/preferences', async (req, res) => {
   const prefs = await savePreferences(req.body ?? {});
-  res.json(ok(prefs, "prefs-2"));
+  res.json(ok(prefs, 'prefs-1'));
 });
 
-app.post("/v1/generation/runs", (req, res) => {
-  const prompt = req.body?.prompt_text || "your ingredients";
+app.post('/v1/generation/runs', (req, res) => {
+  const prompt = req.body?.prompt_text || 'your ingredients';
   const candidates = Object.values(recipes).map((item, index) => ({
     id: item.id,
     title: item.title,
@@ -311,84 +426,82 @@ app.post("/v1/generation/runs", (req, res) => {
     note: item.note,
     rankOrder: index + 1,
   }));
-  res.status(201).json(ok({ run: { generationRunId: "db-run-4" }, candidates }, "gen-1"));
+  res.status(201).json(ok({ run: { generationRunId: crypto.randomUUID() }, candidates }, 'gen-1'));
 });
 
-app.get("/v1/recipes/:id", (req, res) => {
+app.get('/v1/recipes/:id', (req, res) => {
   const recipe = recipes[req.params.id];
-  if (!recipe) return res.status(404).json(notFound("RECIPE_NOT_FOUND", "Recipe not found", "recipe-1"));
-  res.json(ok(recipe, "recipe-2"));
+  if (!recipe) return res.status(404).json(notFound('RECIPE_NOT_FOUND', 'Recipe not found', 'recipe-1'));
+  res.json(ok(recipe, 'recipe-2'));
 });
 
-app.post("/v1/sessions", async (req, res) => {
+app.post('/v1/sessions', async (req, res) => {
   const recipeId = req.body?.recipe_id;
-  if (!recipes[recipeId]) return res.status(404).json(notFound("RECIPE_NOT_FOUND", "Recipe not found", "session-1"));
-  const prefs = await getPreferences();
-  const session = await createSession(recipeId, prefs);
-  res.status(201).json(ok(session, "session-2"));
+  if (!recipes[recipeId]) return res.status(404).json(notFound('RECIPE_NOT_FOUND', 'Recipe not found', 'session-1'));
+  const session = await createSession(recipeId);
+  res.status(201).json(ok(session, 'session-2'));
 });
 
-app.get("/v1/sessions/latest", async (_req, res) => {
+app.get('/v1/sessions/latest', async (_req, res) => {
   const session = await getLatestActiveSession();
-  if (!session) return res.status(404).json(notFound("SESSION_NOT_FOUND", "No active session", "session-latest-1"));
-  res.json(ok(session, "session-latest-2"));
+  if (!session) return res.status(404).json(notFound('SESSION_NOT_FOUND', 'No active session', 'session-latest-1'));
+  res.json(ok(session, 'session-latest-2'));
 });
 
-app.get("/v1/sessions/history", async (_req, res) => {
+app.get('/v1/sessions/history', async (_req, res) => {
   const history = await getSessionHistory(10);
-  res.json(ok(history, "session-history-1"));
+  res.json(ok(history, 'session-history-1'));
 });
 
-app.get("/v1/sessions/:id", async (req, res) => {
+app.get('/v1/sessions/:id', async (req, res) => {
   const session = await getSession(req.params.id);
-  if (!session) return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "session-3"));
-  res.json(ok(session, "session-4"));
+  if (!session) return res.status(404).json(notFound('SESSION_NOT_FOUND', 'Session not found', 'session-3'));
+  res.json(ok(session, 'session-4'));
 });
 
-app.post("/v1/sessions/:id/issues", async (req, res) => {
+app.post('/v1/sessions/:id/issues', async (req, res) => {
   const session = await getSession(req.params.id);
-  if (!session) return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "issue-1"));
-  const issueType = req.body?.issue_type || "unknown";
+  if (!session) return res.status(404).json(notFound('SESSION_NOT_FOUND', 'Session not found', 'issue-1'));
+  const issueType = req.body?.issue_type || 'unknown';
   const recoveryText = issueMessage(issueType);
   await recordIssue(req.params.id, issueType, recoveryText);
-  res.status(201).json(ok({ issueType, recoveryText }, "issue-2"));
+  res.status(201).json(ok({ issueType, recoveryText }, 'issue-2'));
 });
 
-app.post("/v1/sessions/:id/audio-state", async (req, res) => {
+app.post('/v1/sessions/:id/audio-state', async (req, res) => {
   const audioState = await updateSessionAudio(req.params.id, req.body ?? {});
-  if (!audioState) return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "audio-1"));
-  res.json(ok(audioState, "audio-2"));
+  if (!audioState) return res.status(404).json(notFound('SESSION_NOT_FOUND', 'Session not found', 'audio-1'));
+  res.json(ok(audioState, 'audio-2'));
 });
 
-app.post("/v1/sessions/:id/next-step", async (req, res) => {
+app.post('/v1/sessions/:id/next-step', async (req, res) => {
   const session = await advanceSession(req.params.id);
-  if (!session) return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "step-1"));
-  res.json(ok(session, "step-2"));
+  if (!session) return res.status(404).json(notFound('SESSION_NOT_FOUND', 'Session not found', 'step-1'));
+  res.json(ok(session, 'step-2'));
 });
 
-app.post("/v1/sessions/:id/complete", async (req, res) => {
+app.post('/v1/sessions/:id/complete', async (req, res) => {
   const session = await completeSession(req.params.id);
-  if (!session) return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "complete-1"));
-  res.json(ok(session, "complete-2"));
+  if (!session) return res.status(404).json(notFound('SESSION_NOT_FOUND', 'Session not found', 'complete-1'));
+  res.json(ok(session, 'complete-2'));
 });
 
-app.post("/v1/feedback", async (req, res) => {
-  const category = req.body?.category || "general";
-  const note = req.body?.note || "";
+app.post('/v1/feedback', async (req, res) => {
+  const category = req.body?.category || 'general';
+  const note = req.body?.note || '';
   const sessionId = req.body?.sessionId || null;
   const feedback = await saveFeedback(category, note, sessionId);
-  res.status(201).json(ok(feedback, "feedback-1"));
+  res.status(201).json(ok(feedback, 'feedback-1'));
 });
 
-const PORT = process.env.PORT || 4000;
-
-initDb()
+ensureBootstrapRows()
   .then(() => {
+    const PORT = process.env.PORT || 4000;
     app.listen(PORT, () => {
-      console.log(`Nomad Beta backend v4 running on http://0.0.0.0:${PORT}`);
+      console.log(`Nomad DB Build Pack 1A backend running on http://0.0.0.0:${PORT}`);
     });
   })
   .catch((error) => {
-    console.error("Failed to initialize database:", error);
+    console.error('Failed to initialize backend:', error);
     process.exit(1);
   });
