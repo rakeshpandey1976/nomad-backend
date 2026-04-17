@@ -1,18 +1,25 @@
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
+import pg from "pg";
+
+const { Pool } = pg;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-let userPreferences = {
-  userId: "local-user-1",
-  primaryLocale: "en-KE",
-  guidanceMode: "listen_only",
-  ambienceEnabled: true,
-  ambienceMood: "calm_dining",
-};
+const DATABASE_URL = process.env.DATABASE_URL;
+
+if (!DATABASE_URL) {
+  console.error("DATABASE_URL is not set.");
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
 const recipes = {
   pilaf: {
@@ -89,8 +96,6 @@ const recipes = {
   },
 };
 
-const sessions = new Map();
-
 function ok(data, requestId) {
   return {
     success: true,
@@ -132,20 +137,331 @@ function issueMessage(issueType) {
   }
 }
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "nomad-local-backend-v5", now: new Date().toISOString() });
-});
+async function initDb() {
+  await pool.query(`
+    create table if not exists user_preferences (
+      user_id text primary key,
+      primary_locale text not null,
+      guidance_mode text not null,
+      ambience_enabled boolean not null,
+      ambience_mood text not null,
+      updated_at timestamptz not null default now()
+    );
+  `);
 
-app.get("/v1/me", (_req, res) => {
-  res.json(ok(userPreferences, "prefs-1"));
-});
+  await pool.query(`
+    create table if not exists cooking_sessions (
+      session_id text primary key,
+      recipe_id text not null,
+      state text not null,
+      current_phase text not null,
+      current_step_number integer not null,
+      guidance_mode text not null,
+      session_locale text not null,
+      ambience_enabled boolean not null,
+      ambience_mood_tag text not null,
+      audio_muted boolean not null,
+      audio_ducking_active boolean not null,
+      audio_requested_volume numeric not null,
+      completed boolean not null,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
 
-app.patch("/v1/me/preferences", (req, res) => {
-  userPreferences = {
-    ...userPreferences,
-    ...req.body,
+  await pool.query(`
+    create table if not exists session_issues (
+      id bigserial primary key,
+      session_id text not null,
+      issue_type text not null,
+      recovery_text text not null,
+      created_at timestamptz not null default now()
+    );
+  `);
+
+  await pool.query(`
+    insert into user_preferences (
+      user_id,
+      primary_locale,
+      guidance_mode,
+      ambience_enabled,
+      ambience_mood
+    )
+    values (
+      'local-user-1',
+      'en-KE',
+      'listen_only',
+      true,
+      'calm_dining'
+    )
+    on conflict (user_id) do nothing;
+  `);
+}
+
+async function getPreferences() {
+  const result = await pool.query(
+    `select user_id, primary_locale, guidance_mode, ambience_enabled, ambience_mood
+     from user_preferences
+     where user_id = 'local-user-1'
+     limit 1`
+  );
+
+  const row = result.rows[0];
+  return {
+    userId: row.user_id,
+    primaryLocale: row.primary_locale,
+    guidanceMode: row.guidance_mode,
+    ambienceEnabled: row.ambience_enabled,
+    ambienceMood: row.ambience_mood,
   };
-  res.json(ok(userPreferences, "prefs-2"));
+}
+
+async function savePreferences(updates) {
+  const current = await getPreferences();
+
+  const next = {
+    userId: "local-user-1",
+    primaryLocale: updates.primaryLocale ?? current.primaryLocale,
+    guidanceMode: updates.guidanceMode ?? current.guidanceMode,
+    ambienceEnabled:
+      typeof updates.ambienceEnabled === "boolean"
+        ? updates.ambienceEnabled
+        : current.ambienceEnabled,
+    ambienceMood: updates.ambienceMood ?? current.ambienceMood,
+  };
+
+  await pool.query(
+    `
+      update user_preferences
+      set
+        primary_locale = $1,
+        guidance_mode = $2,
+        ambience_enabled = $3,
+        ambience_mood = $4,
+        updated_at = now()
+      where user_id = 'local-user-1'
+    `,
+    [
+      next.primaryLocale,
+      next.guidanceMode,
+      next.ambienceEnabled,
+      next.ambienceMood,
+    ]
+  );
+
+  return next;
+}
+
+async function createSession(recipeId, preferences) {
+  const sessionId = crypto.randomUUID();
+
+  const session = {
+    sessionId,
+    recipeId,
+    state: "cook_active",
+    currentPhase: "prep",
+    currentStepNumber: 1,
+    guidanceMode: preferences.guidanceMode,
+    sessionLocale: preferences.primaryLocale,
+    ambienceEnabled: preferences.ambienceEnabled,
+    ambienceMoodTag: preferences.ambienceMood,
+    audioState: {
+      muted: false,
+      duckingActive: true,
+      requestedVolume: 0.35,
+    },
+    completed: false,
+    createdAt: new Date().toISOString(),
+  };
+
+  await pool.query(
+    `
+      insert into cooking_sessions (
+        session_id,
+        recipe_id,
+        state,
+        current_phase,
+        current_step_number,
+        guidance_mode,
+        session_locale,
+        ambience_enabled,
+        ambience_mood_tag,
+        audio_muted,
+        audio_ducking_active,
+        audio_requested_volume,
+        completed
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    `,
+    [
+      session.sessionId,
+      session.recipeId,
+      session.state,
+      session.currentPhase,
+      session.currentStepNumber,
+      session.guidanceMode,
+      session.sessionLocale,
+      session.ambienceEnabled,
+      session.ambienceMoodTag,
+      session.audioState.muted,
+      session.audioState.duckingActive,
+      session.audioState.requestedVolume,
+      session.completed,
+    ]
+  );
+
+  return session;
+}
+
+async function getSession(sessionId) {
+  const result = await pool.query(
+    `
+      select *
+      from cooking_sessions
+      where session_id = $1
+      limit 1
+    `,
+    [sessionId]
+  );
+
+  if (result.rowCount === 0) return null;
+
+  const row = result.rows[0];
+  return {
+    sessionId: row.session_id,
+    recipeId: row.recipe_id,
+    state: row.state,
+    currentPhase: row.current_phase,
+    currentStepNumber: row.current_step_number,
+    guidanceMode: row.guidance_mode,
+    sessionLocale: row.session_locale,
+    ambienceEnabled: row.ambience_enabled,
+    ambienceMoodTag: row.ambience_mood_tag,
+    audioState: {
+      muted: row.audio_muted,
+      duckingActive: row.audio_ducking_active,
+      requestedVolume: Number(row.audio_requested_volume),
+    },
+    completed: row.completed,
+    createdAt: row.created_at,
+  };
+}
+
+async function updateSessionAudio(sessionId, audioPatch) {
+  const session = await getSession(sessionId);
+  if (!session) return null;
+
+  const nextAudio = {
+    ...session.audioState,
+    ...audioPatch,
+  };
+
+  await pool.query(
+    `
+      update cooking_sessions
+      set
+        audio_muted = $1,
+        audio_ducking_active = $2,
+        audio_requested_volume = $3,
+        updated_at = now()
+      where session_id = $4
+    `,
+    [
+      nextAudio.muted,
+      nextAudio.duckingActive,
+      nextAudio.requestedVolume,
+      sessionId,
+    ]
+  );
+
+  return nextAudio;
+}
+
+async function advanceSession(sessionId) {
+  const session = await getSession(sessionId);
+  if (!session) return null;
+
+  const recipe = recipes[session.recipeId];
+  const maxSteps = recipe.steps.length;
+
+  let nextStep = session.currentStepNumber;
+  let nextPhase = session.currentPhase;
+
+  if (nextStep < maxSteps) {
+    nextStep += 1;
+    nextPhase = nextStep === maxSteps ? "finish" : "cook";
+  }
+
+  await pool.query(
+    `
+      update cooking_sessions
+      set
+        current_step_number = $1,
+        current_phase = $2,
+        updated_at = now()
+      where session_id = $3
+    `,
+    [nextStep, nextPhase, sessionId]
+  );
+
+  return getSession(sessionId);
+}
+
+async function completeSession(sessionId) {
+  const session = await getSession(sessionId);
+  if (!session) return null;
+
+  await pool.query(
+    `
+      update cooking_sessions
+      set
+        state = 'completed',
+        current_phase = 'serve',
+        completed = true,
+        updated_at = now()
+      where session_id = $1
+    `,
+    [sessionId]
+  );
+
+  return getSession(sessionId);
+}
+
+async function recordIssue(sessionId, issueType, recoveryText) {
+  await pool.query(
+    `
+      insert into session_issues (session_id, issue_type, recovery_text)
+      values ($1, $2, $3)
+    `,
+    [sessionId, issueType, recoveryText]
+  );
+}
+
+app.get("/health", async (_req, res) => {
+  try {
+    await pool.query("select 1");
+    res.json({
+      ok: true,
+      service: "nomad-postgres-backend-v1",
+      now: new Date().toISOString(),
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      service: "nomad-postgres-backend-v1",
+      error: "database_unavailable",
+    });
+  }
+});
+
+app.get("/v1/me", async (_req, res) => {
+  const preferences = await getPreferences();
+  res.json(ok(preferences, "prefs-1"));
+});
+
+app.patch("/v1/me/preferences", async (req, res) => {
+  const preferences = await savePreferences(req.body ?? {});
+  res.json(ok(preferences, "prefs-2"));
 });
 
 app.post("/v1/generation/runs", (req, res) => {
@@ -161,7 +477,7 @@ app.post("/v1/generation/runs", (req, res) => {
     rankOrder: index + 1,
   }));
 
-  res.status(201).json(ok({ run: { generationRunId: "local-run-5" }, candidates }, "gen-1"));
+  res.status(201).json(ok({ run: { generationRunId: "local-run-db-1" }, candidates }, "gen-1"));
 });
 
 app.get("/v1/recipes/:id", (req, res) => {
@@ -172,8 +488,7 @@ app.get("/v1/recipes/:id", (req, res) => {
   res.json(ok(recipe, "recipe-2"));
 });
 
-app.post("/v1/sessions", (req, res) => {
-  const sessionId = crypto.randomUUID();
+app.post("/v1/sessions", async (req, res) => {
   const recipeId = req.body?.recipe_id;
   const recipe = recipes[recipeId];
 
@@ -181,97 +496,68 @@ app.post("/v1/sessions", (req, res) => {
     return res.status(404).json(notFound("RECIPE_NOT_FOUND", "Recipe not found", "session-1"));
   }
 
-  const session = {
-    sessionId,
-    recipeId,
-    state: "cook_active",
-    currentPhase: "prep",
-    currentStepNumber: 1,
-    guidanceMode: userPreferences.guidanceMode,
-    sessionLocale: userPreferences.primaryLocale,
-    ambienceEnabled: userPreferences.ambienceEnabled,
-    ambienceMoodTag: userPreferences.ambienceMood,
-    audioState: {
-      muted: false,
-      duckingActive: true,
-      requestedVolume: 0.35,
-    },
-    completed: false,
-    createdAt: new Date().toISOString(),
-  };
-
-  sessions.set(sessionId, session);
+  const preferences = await getPreferences();
+  const session = await createSession(recipeId, preferences);
   res.status(201).json(ok(session, "session-2"));
 });
 
-app.get("/v1/sessions/:id", (req, res) => {
-  const session = sessions.get(req.params.id);
+app.get("/v1/sessions/:id", async (req, res) => {
+  const session = await getSession(req.params.id);
   if (!session) {
     return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "session-3"));
   }
   res.json(ok(session, "session-4"));
 });
 
-app.post("/v1/sessions/:id/issues", (req, res) => {
-  const session = sessions.get(req.params.id);
+app.post("/v1/sessions/:id/issues", async (req, res) => {
+  const session = await getSession(req.params.id);
   if (!session) {
     return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "issue-1"));
   }
 
   const issueType = req.body?.issue_type || "unknown";
   const recoveryText = issueMessage(issueType);
+  await recordIssue(req.params.id, issueType, recoveryText);
 
   res.status(201).json(ok({ issueType, recoveryText }, "issue-2"));
 });
 
-app.post("/v1/sessions/:id/audio-state", (req, res) => {
-  const session = sessions.get(req.params.id);
-  if (!session) {
+app.post("/v1/sessions/:id/audio-state", async (req, res) => {
+  const audioState = await updateSessionAudio(req.params.id, req.body ?? {});
+  if (!audioState) {
     return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "audio-1"));
   }
 
-  session.audioState = {
-    ...session.audioState,
-    ...req.body,
-  };
-
-  sessions.set(req.params.id, session);
-  res.json(ok(session.audioState, "audio-2"));
+  res.json(ok(audioState, "audio-2"));
 });
 
-app.post("/v1/sessions/:id/next-step", (req, res) => {
-  const session = sessions.get(req.params.id);
+app.post("/v1/sessions/:id/next-step", async (req, res) => {
+  const session = await advanceSession(req.params.id);
   if (!session) {
     return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "step-1"));
   }
 
-  const recipe = recipes[session.recipeId];
-  const maxSteps = recipe.steps.length;
-
-  if (session.currentStepNumber < maxSteps) {
-    session.currentStepNumber += 1;
-    session.currentPhase = session.currentStepNumber === maxSteps ? "finish" : "cook";
-  }
-
-  sessions.set(req.params.id, session);
   res.json(ok(session, "step-2"));
 });
 
-app.post("/v1/sessions/:id/complete", (req, res) => {
-  const session = sessions.get(req.params.id);
+app.post("/v1/sessions/:id/complete", async (req, res) => {
+  const session = await completeSession(req.params.id);
   if (!session) {
     return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "complete-1"));
   }
 
-  session.state = "completed";
-  session.currentPhase = "serve";
-  session.completed = true;
-
-  sessions.set(req.params.id, session);
   res.json(ok(session, "complete-2"));
 });
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`Nomad local backend v5 running on http://0.0.0.0:${PORT}`);
-});
+
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Nomad Postgres backend running on http://0.0.0.0:${PORT}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Failed to initialize database:", error);
+    process.exit(1);
+  });
