@@ -207,6 +207,7 @@ async function getPreferences() {
   );
 
   const row = result.rows[0];
+
   return {
     userId: row.user_id,
     primaryLocale: row.primary_locale,
@@ -252,6 +253,27 @@ async function savePreferences(updates) {
   return next;
 }
 
+function mapSession(row) {
+  return {
+    sessionId: row.session_id,
+    recipeId: row.recipe_id,
+    state: row.state,
+    currentPhase: row.current_phase,
+    currentStepNumber: row.current_step_number,
+    guidanceMode: row.guidance_mode,
+    sessionLocale: row.session_locale,
+    ambienceEnabled: row.ambience_enabled,
+    ambienceMoodTag: row.ambience_mood_tag,
+    audioState: {
+      muted: row.audio_muted,
+      duckingActive: row.audio_ducking_active,
+      requestedVolume: Number(row.audio_requested_volume),
+    },
+    completed: row.completed,
+    createdAt: row.created_at,
+  };
+}
+
 async function createSession(recipeId, preferences) {
   const sessionId = crypto.randomUUID();
 
@@ -271,7 +293,6 @@ async function createSession(recipeId, preferences) {
       requestedVolume: 0.35,
     },
     completed: false,
-    createdAt: new Date().toISOString(),
   };
 
   await pool.query(
@@ -310,41 +331,34 @@ async function createSession(recipeId, preferences) {
     ]
   );
 
-  return session;
+  return getSession(sessionId);
 }
 
 async function getSession(sessionId) {
   const result = await pool.query(
-    `
-      select *
-      from cooking_sessions
-      where session_id = $1
-      limit 1
-    `,
+    `select * from cooking_sessions where session_id = $1 limit 1`,
     [sessionId]
   );
 
   if (result.rowCount === 0) return null;
 
-  const row = result.rows[0];
-  return {
-    sessionId: row.session_id,
-    recipeId: row.recipe_id,
-    state: row.state,
-    currentPhase: row.current_phase,
-    currentStepNumber: row.current_step_number,
-    guidanceMode: row.guidance_mode,
-    sessionLocale: row.session_locale,
-    ambienceEnabled: row.ambience_enabled,
-    ambienceMoodTag: row.ambience_mood_tag,
-    audioState: {
-      muted: row.audio_muted,
-      duckingActive: row.audio_ducking_active,
-      requestedVolume: Number(row.audio_requested_volume),
-    },
-    completed: row.completed,
-    createdAt: row.created_at,
-  };
+  return mapSession(result.rows[0]);
+}
+
+async function getLatestActiveSession() {
+  const result = await pool.query(
+    `
+      select *
+      from cooking_sessions
+      where completed = false
+      order by updated_at desc, created_at desc
+      limit 1
+    `
+  );
+
+  if (result.rowCount === 0) return null;
+
+  return mapSession(result.rows[0]);
 }
 
 async function updateSessionAudio(sessionId, audioPatch) {
@@ -408,9 +422,6 @@ async function advanceSession(sessionId) {
 }
 
 async function completeSession(sessionId) {
-  const session = await getSession(sessionId);
-  if (!session) return null;
-
   await pool.query(
     `
       update cooking_sessions
@@ -442,26 +453,26 @@ app.get("/health", async (_req, res) => {
     await pool.query("select 1");
     res.json({
       ok: true,
-      service: "nomad-postgres-backend-v1",
+      service: "nomad-postgres-backend-v2",
       now: new Date().toISOString(),
     });
-  } catch (error) {
+  } catch {
     res.status(500).json({
       ok: false,
-      service: "nomad-postgres-backend-v1",
+      service: "nomad-postgres-backend-v2",
       error: "database_unavailable",
     });
   }
 });
 
 app.get("/v1/me", async (_req, res) => {
-  const preferences = await getPreferences();
-  res.json(ok(preferences, "prefs-1"));
+  const prefs = await getPreferences();
+  res.json(ok(prefs, "prefs-1"));
 });
 
 app.patch("/v1/me/preferences", async (req, res) => {
-  const preferences = await savePreferences(req.body ?? {});
-  res.json(ok(preferences, "prefs-2"));
+  const prefs = await savePreferences(req.body ?? {});
+  res.json(ok(prefs, "prefs-2"));
 });
 
 app.post("/v1/generation/runs", (req, res) => {
@@ -471,40 +482,60 @@ app.post("/v1/generation/runs", (req, res) => {
     id: item.id,
     title: item.title,
     mode: item.mode,
-    reason: index === 0 ? `A light, practical dish built from ${prompt}.` : item.reason,
+    reason:
+      index === 0
+        ? `A light, practical dish built from ${prompt}.`
+        : item.reason,
     time: item.time,
     note: item.note,
     rankOrder: index + 1,
   }));
 
-  res.status(201).json(ok({ run: { generationRunId: "local-run-db-1" }, candidates }, "gen-1"));
+  res
+    .status(201)
+    .json(ok({ run: { generationRunId: "db-run-2" }, candidates }, "gen-1"));
 });
 
 app.get("/v1/recipes/:id", (req, res) => {
   const recipe = recipes[req.params.id];
   if (!recipe) {
-    return res.status(404).json(notFound("RECIPE_NOT_FOUND", "Recipe not found", "recipe-1"));
+    return res
+      .status(404)
+      .json(notFound("RECIPE_NOT_FOUND", "Recipe not found", "recipe-1"));
   }
   res.json(ok(recipe, "recipe-2"));
 });
 
 app.post("/v1/sessions", async (req, res) => {
   const recipeId = req.body?.recipe_id;
-  const recipe = recipes[recipeId];
 
-  if (!recipe) {
-    return res.status(404).json(notFound("RECIPE_NOT_FOUND", "Recipe not found", "session-1"));
+  if (!recipes[recipeId]) {
+    return res
+      .status(404)
+      .json(notFound("RECIPE_NOT_FOUND", "Recipe not found", "session-1"));
   }
 
-  const preferences = await getPreferences();
-  const session = await createSession(recipeId, preferences);
+  const prefs = await getPreferences();
+  const session = await createSession(recipeId, prefs);
   res.status(201).json(ok(session, "session-2"));
+});
+
+app.get("/v1/sessions/latest", async (_req, res) => {
+  const session = await getLatestActiveSession();
+  if (!session) {
+    return res
+      .status(404)
+      .json(notFound("SESSION_NOT_FOUND", "No active session", "session-latest-1"));
+  }
+  res.json(ok(session, "session-latest-2"));
 });
 
 app.get("/v1/sessions/:id", async (req, res) => {
   const session = await getSession(req.params.id);
   if (!session) {
-    return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "session-3"));
+    return res
+      .status(404)
+      .json(notFound("SESSION_NOT_FOUND", "Session not found", "session-3"));
   }
   res.json(ok(session, "session-4"));
 });
@@ -512,7 +543,9 @@ app.get("/v1/sessions/:id", async (req, res) => {
 app.post("/v1/sessions/:id/issues", async (req, res) => {
   const session = await getSession(req.params.id);
   if (!session) {
-    return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "issue-1"));
+    return res
+      .status(404)
+      .json(notFound("SESSION_NOT_FOUND", "Session not found", "issue-1"));
   }
 
   const issueType = req.body?.issue_type || "unknown";
@@ -525,7 +558,9 @@ app.post("/v1/sessions/:id/issues", async (req, res) => {
 app.post("/v1/sessions/:id/audio-state", async (req, res) => {
   const audioState = await updateSessionAudio(req.params.id, req.body ?? {});
   if (!audioState) {
-    return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "audio-1"));
+    return res
+      .status(404)
+      .json(notFound("SESSION_NOT_FOUND", "Session not found", "audio-1"));
   }
 
   res.json(ok(audioState, "audio-2"));
@@ -534,7 +569,9 @@ app.post("/v1/sessions/:id/audio-state", async (req, res) => {
 app.post("/v1/sessions/:id/next-step", async (req, res) => {
   const session = await advanceSession(req.params.id);
   if (!session) {
-    return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "step-1"));
+    return res
+      .status(404)
+      .json(notFound("SESSION_NOT_FOUND", "Session not found", "step-1"));
   }
 
   res.json(ok(session, "step-2"));
@@ -543,7 +580,9 @@ app.post("/v1/sessions/:id/next-step", async (req, res) => {
 app.post("/v1/sessions/:id/complete", async (req, res) => {
   const session = await completeSession(req.params.id);
   if (!session) {
-    return res.status(404).json(notFound("SESSION_NOT_FOUND", "Session not found", "complete-1"));
+    return res
+      .status(404)
+      .json(notFound("SESSION_NOT_FOUND", "Session not found", "complete-1"));
   }
 
   res.json(ok(session, "complete-2"));
@@ -554,7 +593,7 @@ const PORT = process.env.PORT || 4000;
 initDb()
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`Nomad Postgres backend running on http://0.0.0.0:${PORT}`);
+      console.log(`Nomad Postgres backend v2 running on http://0.0.0.0:${PORT}`);
     });
   })
   .catch((error) => {
