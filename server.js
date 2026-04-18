@@ -232,11 +232,11 @@ async function createSession(recipeId) {
 
 async function getSession(sessionId) {
   const result = await pool.query(
-    `select cs.*, 
-            coalesce(sa.ambient_enabled, cs.ambience_enabled) as audio_ambient_enabled,
-            coalesce(sa.muted, cs.audio_muted) as audio_muted_effective,
-            coalesce(sa.ducking_active, cs.audio_ducking_active) as audio_ducking_effective,
-            coalesce(sa.requested_volume, cs.audio_requested_volume) as audio_requested_effective
+    `select cs.*,
+            coalesce(sa.ambient_enabled, true) as audio_ambient_enabled,
+            coalesce(sa.muted, false) as audio_muted_effective,
+            coalesce(sa.ducking_active, true) as audio_ducking_effective,
+            coalesce(sa.requested_volume, 0.35) as audio_requested_effective
      from cooking_sessions cs
      left join session_audio_state sa on sa.session_id = cs.session_id
      where cs.session_id = $1
@@ -254,14 +254,14 @@ async function getSession(sessionId) {
     currentStepNumber: row.current_step_number,
     guidanceMode: row.guidance_mode,
     sessionLocale: row.session_locale,
-    ambienceEnabled: row.ambience_enabled,
+    ambienceEnabled: row.audio_ambient_enabled,
     ambienceMoodTag: row.ambience_mood_tag,
     audioState: {
       muted: row.audio_muted_effective,
       duckingActive: row.audio_ducking_effective,
       requestedVolume: Number(row.audio_requested_effective),
     },
-    completed: row.completed,
+    completed: row.state === 'completed',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -271,7 +271,7 @@ async function getLatestActiveSession() {
   const result = await pool.query(
     `select session_id
      from cooking_sessions
-     where user_id = $1 and completed = false
+     where user_id = $1 and state <> 'completed'
      order by updated_at desc, created_at desc
      limit 1`,
     [CURRENT_USER_ID]
@@ -318,13 +318,10 @@ async function updateSessionAudio(sessionId, patch) {
 
   await pool.query(
     `update cooking_sessions
-     set audio_muted = $1,
-         audio_ducking_active = $2,
-         audio_requested_volume = $3,
-         updated_at = now(),
+     set updated_at = now(),
          last_active_at = now()
-     where session_id = $4`,
-    [muted, duckingActive, requestedVolume, sessionId]
+     where session_id = $1`,
+    [sessionId]
   );
 
   return (await getSession(sessionId)).audioState;
@@ -366,7 +363,6 @@ async function completeSession(sessionId) {
     `update cooking_sessions
      set state = 'completed',
          current_phase = 'serve',
-         completed = true,
          completed_at = now(),
          updated_at = now(),
          last_active_at = now()
@@ -399,9 +395,9 @@ async function saveFeedback(category, note, sessionId = null) {
 app.get('/health', async (_req, res) => {
   try {
     await pool.query('select 1');
-    res.json({ ok: true, service: 'nomad-db-build-pack-1a', now: new Date().toISOString() });
+    res.json({ ok: true, service: 'nomad-db-build-pack-1b', now: new Date().toISOString() });
   } catch {
-    res.status(500).json({ ok: false, service: 'nomad-db-build-pack-1a', error: 'database_unavailable' });
+    res.status(500).json({ ok: false, service: 'nomad-db-build-pack-1b', error: 'database_unavailable' });
   }
 });
 
@@ -491,9 +487,7 @@ app.post('/v1/feedback', async (req, res) => {
     const category = req.body?.category || 'general';
     const note = req.body?.note || '';
     const sessionId = req.body?.sessionId || null;
-
     const feedback = await saveFeedback(category, note, sessionId);
-
     res.status(201).json(ok(feedback, 'feedback-1'));
   } catch (error) {
     console.error('Feedback route failed:', error);
@@ -502,12 +496,12 @@ app.post('/v1/feedback', async (req, res) => {
       error: {
         code: 'FEEDBACK_SAVE_FAILED',
         message: 'Could not save feedback',
-        retryable: false
+        retryable: false,
       },
       meta: {
         request_id: 'feedback-1',
-        api_version: 'v1'
-      }
+        api_version: 'v1',
+      },
     });
   }
 });
