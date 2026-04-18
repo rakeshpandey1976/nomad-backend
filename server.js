@@ -89,6 +89,129 @@ function issueMessage(issueType) {
   }
 }
 
+function mapRecipeTypeToMode(recipeType) {
+  switch (recipeType) {
+    case 'traditional_anchor':
+      return 'Traditional';
+    case 'adaptive_household':
+      return 'Inspired';
+    case 'inventive_nomad':
+      return 'Inventive';
+    default:
+      return 'Inspired';
+  }
+}
+
+async function getRecipeSummaryRows(locale = 'en-KE') {
+  const result = await pool.query(
+    `select
+        r.recipe_id,
+        r.slug,
+        r.canonical_title,
+        r.recipe_type,
+        r.estimated_time_minutes,
+        r.cultural_identity_note,
+        r.health_note,
+        coalesce(rl.localized_title, r.canonical_title) as localized_title,
+        coalesce(rl.summary_text, r.cultural_identity_note, r.health_note, 'A practical recipe direction.') as summary_text
+     from recipes r
+     left join recipe_localizations rl
+       on rl.recipe_id = r.recipe_id
+      and rl.locale_code = $1
+     where r.status = 'approved'
+     order by r.slug`,
+    [locale]
+  );
+  return result.rows;
+}
+
+async function getRecipeBySlug(slug, locale = 'en-KE') {
+  const header = await pool.query(
+    `select
+        r.recipe_id,
+        r.slug,
+        r.canonical_title,
+        r.recipe_type,
+        r.estimated_time_minutes,
+        r.cultural_identity_note,
+        r.health_note,
+        coalesce(rl.localized_title, r.canonical_title) as localized_title,
+        coalesce(rl.summary_text, r.cultural_identity_note, r.health_note, 'A practical recipe direction.') as summary_text
+     from recipes r
+     left join recipe_localizations rl
+       on rl.recipe_id = r.recipe_id
+      and rl.locale_code = $2
+     where r.slug = $1
+     limit 1`,
+    [slug, locale]
+  );
+
+  if (header.rowCount === 0) return null;
+
+  const row = header.rows[0];
+
+  const phasesResult = await pool.query(
+    `select display_title
+     from recipe_phases
+     where recipe_id = $1
+     order by sequence_order`,
+    [row.recipe_id]
+  );
+
+  const stepsResult = await pool.query(
+    `select
+        rs.recipe_step_id,
+        rs.step_number,
+        rs.instruction_text,
+        rs.spoken_instruction_text,
+        rs.sequence_order,
+        (
+          select sc.cue_text
+          from step_cues sc
+          where sc.recipe_step_id = rs.recipe_step_id
+          order by sc.is_primary desc, sc.step_cue_id
+          limit 1
+        ) as cue_text,
+        (
+          select sca.caution_text
+          from step_cautions sca
+          where sca.recipe_step_id = rs.recipe_step_id
+          order by sca.step_caution_id
+          limit 1
+        ) as caution_text
+     from recipe_steps rs
+     where rs.recipe_id = $1
+     order by rs.sequence_order`,
+    [row.recipe_id]
+  );
+
+  return {
+    id: row.slug,
+    title: row.localized_title,
+    mode: mapRecipeTypeToMode(row.recipe_type),
+    reason: row.summary_text,
+    time: row.estimated_time_minutes ? `${row.estimated_time_minutes} min` : 'Time varies',
+    note: row.health_note || row.cultural_identity_note || row.summary_text,
+    phases: phasesResult.rows.map((p) => p.display_title),
+    steps: stepsResult.rows.map((s) => ({
+      instruction: s.instruction_text,
+      cue: s.cue_text || '',
+      caution: s.caution_text || '',
+    })),
+  };
+}
+
+async function getRecipeStepCountBySlug(slug) {
+  const result = await pool.query(
+    `select count(*)::int as step_count
+     from recipe_steps rs
+     join recipes r on r.recipe_id = rs.recipe_id
+     where r.slug = $1`,
+    [slug]
+  );
+  return result.rows[0]?.step_count ?? 0;
+}
+
 async function ensureBootstrapRows() {
   await pool.query(
     `insert into users (user_id, display_name, account_status, signup_source)
@@ -181,7 +304,7 @@ function mapSession(row) {
   return {
     sessionId: row.session_id,
     recipeId: row.recipe_id,
-    recipeTitle: recipes[row.recipe_id]?.title ?? row.recipe_id,
+    recipeTitle: row.recipe_title ?? row.recipe_id,
     state: row.state,
     currentPhase: row.current_phase,
     currentStepNumber: row.current_step_number,
@@ -233,11 +356,14 @@ async function createSession(recipeId) {
 async function getSession(sessionId) {
   const result = await pool.query(
     `select cs.*,
+            coalesce(rl.localized_title, r.canonical_title) as recipe_title,
             coalesce(sa.ambient_enabled, true) as audio_ambient_enabled,
             coalesce(sa.muted, false) as audio_muted_effective,
             coalesce(sa.ducking_active, true) as audio_ducking_effective,
             coalesce(sa.requested_volume, 0.35) as audio_requested_effective
      from cooking_sessions cs
+     left join recipes r on r.slug = cs.recipe_id
+     left join recipe_localizations rl on rl.recipe_id = r.recipe_id and rl.locale_code = 'en-KE'
      left join session_audio_state sa on sa.session_id = cs.session_id
      where cs.session_id = $1
      limit 1`,
@@ -248,7 +374,7 @@ async function getSession(sessionId) {
   return {
     sessionId: row.session_id,
     recipeId: row.recipe_id,
-    recipeTitle: recipes[row.recipe_id]?.title ?? row.recipe_id,
+    recipeTitle: row.recipe_title ?? row.recipe_id,
     state: row.state,
     currentPhase: row.current_phase,
     currentStepNumber: row.current_step_number,
@@ -330,8 +456,7 @@ async function updateSessionAudio(sessionId, patch) {
 async function advanceSession(sessionId) {
   const session = await getSession(sessionId);
   if (!session) return null;
-  const recipe = recipes[session.recipeId];
-  const maxSteps = recipe.steps.length;
+  const maxSteps = await getRecipeStepCountBySlug(session.recipeId);
   let nextStep = session.currentStepNumber;
   let nextPhase = session.currentPhase;
   if (nextStep < maxSteps) {
@@ -395,9 +520,9 @@ async function saveFeedback(category, note, sessionId = null) {
 app.get('/health', async (_req, res) => {
   try {
     await pool.query('select 1');
-    res.json({ ok: true, service: 'nomad-db-build-pack-1b', now: new Date().toISOString() });
+    res.json({ ok: true, service: 'nomad-db-build-pack-2a', now: new Date().toISOString() });
   } catch {
-    res.status(500).json({ ok: false, service: 'nomad-db-build-pack-1b', error: 'database_unavailable' });
+    res.status(500).json({ ok: false, service: 'nomad-db-build-pack-2a', error: 'database_unavailable' });
   }
 });
 
@@ -411,29 +536,31 @@ app.patch('/v1/me/preferences', async (req, res) => {
   res.json(ok(prefs, 'prefs-1'));
 });
 
-app.post('/v1/generation/runs', (req, res) => {
+app.post('/v1/generation/runs', async (req, res) => {
   const prompt = req.body?.prompt_text || 'your ingredients';
-  const candidates = Object.values(recipes).map((item, index) => ({
-    id: item.id,
-    title: item.title,
-    mode: item.mode,
-    reason: index === 0 ? `A light, practical dish built from ${prompt}.` : item.reason,
-    time: item.time,
-    note: item.note,
+  const rows = await getRecipeSummaryRows('en-KE');
+  const candidates = rows.map((item, index) => ({
+    id: item.slug,
+    title: item.localized_title,
+    mode: mapRecipeTypeToMode(item.recipe_type),
+    reason: index === 0 ? `A practical dish direction built from ${prompt}.` : item.summary_text,
+    time: item.estimated_time_minutes ? `${item.estimated_time_minutes} min` : 'Time varies',
+    note: item.health_note || item.cultural_identity_note || item.summary_text,
     rankOrder: index + 1,
   }));
   res.status(201).json(ok({ run: { generationRunId: crypto.randomUUID() }, candidates }, 'gen-1'));
 });
 
-app.get('/v1/recipes/:id', (req, res) => {
-  const recipe = recipes[req.params.id];
+app.get('/v1/recipes/:id', async (req, res) => {
+  const recipe = await getRecipeBySlug(req.params.id, 'en-KE');
   if (!recipe) return res.status(404).json(notFound('RECIPE_NOT_FOUND', 'Recipe not found', 'recipe-1'));
   res.json(ok(recipe, 'recipe-2'));
 });
 
 app.post('/v1/sessions', async (req, res) => {
   const recipeId = req.body?.recipe_id;
-  if (!recipes[recipeId]) return res.status(404).json(notFound('RECIPE_NOT_FOUND', 'Recipe not found', 'session-1'));
+  const recipe = await getRecipeBySlug(recipeId, 'en-KE');
+  if (!recipe) return res.status(404).json(notFound('RECIPE_NOT_FOUND', 'Recipe not found', 'session-1'));
   const session = await createSession(recipeId);
   res.status(201).json(ok(session, 'session-2'));
 });
